@@ -1,0 +1,12 @@
+# repowiki.toml
+# Read by repowiki's collector from the repository root.
+
+# Landing page of the registered site.
+default_route = "/README"
+
+# Symlinked as static files, not listed in navigation.
+static_dirs = ["out"]
+
+[crate_resolution]
+# Navigation groups
+prefixes = ["docs", "libinfer", "libinfer-gemini"]
