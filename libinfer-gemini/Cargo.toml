@@ -1,0 +1,14 @@
+[package]
+name = "libinfer-gemini"
+version = "0.1.0"
+edition = "2024"
+description = "The Gemini provider for libinfer: GeminiReasoningEngine on gemini-rust."
+
+[dependencies]
+libinfer = { path = "../libinfer" }
+# Used directly, not through libgenai
+# (docs/design/20261022_07_LIBINFER_PROVIDERS_PLAN.md, section 2).
+gemini-rust = "1.7"
+async-compat = "0.2"
+async-trait = "0.1"
+log = "0.4"
