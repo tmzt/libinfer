@@ -1,0 +1,10 @@
+[workspace]
+members = [
+    "libinfer",
+    "libinfer-gemini",
+]
+default-members = [
+    "libinfer",
+    "libinfer-gemini",
+]
+resolver = "2"

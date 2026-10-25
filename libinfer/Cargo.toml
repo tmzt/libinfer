@@ -1,0 +1,16 @@
+[package]
+name = "libinfer"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+async-trait = "0.1"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+# No provider, network client or async runtime here: Gemini is in
+# libinfer-gemini (docs/design/20261022_07_LIBINFER_PROVIDERS_PLAN.md).
+log = "0.4"
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
