@@ -7,8 +7,24 @@
 
 use std::collections::BTreeSet;
 use std::fmt;
+use std::time::Duration;
+
+use async_compat::CompatExt;
+use serde::Deserialize;
 
 use crate::DEFAULT_MODEL;
+
+/// Where the Gemini API lists models.
+const MODELS_URL: &str = "https://generativelanguage.googleapis.com/v1beta";
+
+/// The largest page the API serves.
+const PAGE_SIZE: &str = "1000";
+
+/// How long one page request may take.
+const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// The most of an error response's body kept in an error.
+const ERROR_BODY_CHARS: usize = 300;
 
 /// A Gemini model's level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
@@ -172,6 +188,15 @@ impl ModelCatalog {
         }
     }
 
+    /// Lists the key's models: `GET …/v1beta/models?pageSize=1000`, every
+    /// page, the key in `x-goog-api-key`, keeping those whose
+    /// `supportedGenerationMethods` has `generateContent`. Errors are the
+    /// HTTP or JSON failure as text, never containing the key. Call it once
+    /// and keep the catalog for the life of the process (decision 7).
+    pub async fn fetch(api_key: &str) -> Result<ModelCatalog, String> {
+        fetch_from(MODELS_URL, api_key).await
+    }
+
     /// The names listed, sorted.
     pub fn names(&self) -> Vec<String> {
         self.names.iter().cloned().collect()
@@ -244,6 +269,104 @@ fn fallback() -> Resolved {
         model: DEFAULT_MODEL.to_string(),
         how: How::Fallback,
     }
+}
+
+/// One page of `GET /v1beta/models`.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ModelsPage {
+    #[serde(default)]
+    models: Vec<ListedModel>,
+    #[serde(default)]
+    next_page_token: Option<String>,
+}
+
+/// One listed model; `displayName` and `version` are listed too, but the
+/// match reads only the name.
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ListedModel {
+    name: String,
+    #[serde(default)]
+    supported_generation_methods: Vec<String>,
+}
+
+/// [`ModelCatalog::fetch`] against `base` (`…/v1beta`), so tests can serve
+/// the list locally.
+async fn fetch_from(base: &str, api_key: &str) -> Result<ModelCatalog, String> {
+    let scrub = |text: String| {
+        if api_key.is_empty() {
+            text
+        } else {
+            text.replace(api_key, "<key>")
+        }
+    };
+    let client = reqwest::Client::builder()
+        .timeout(FETCH_TIMEOUT)
+        .build()
+        .map_err(|e| scrub(format!("gemini: listing models: {e}")))?;
+    let url = format!("{}/models", base.trim_end_matches('/'));
+    let mut names = BTreeSet::new();
+    let mut page_token: Option<String> = None;
+    loop {
+        let mut query = vec![("pageSize", PAGE_SIZE.to_string())];
+        if let Some(token) = &page_token {
+            query.push(("pageToken", token.clone()));
+        }
+        let page = fetch_page(&client, &url, &query, api_key)
+            .compat()
+            .await
+            .map_err(scrub)?;
+        names.extend(
+            page.models
+                .into_iter()
+                .filter(|model| {
+                    model
+                        .supported_generation_methods
+                        .iter()
+                        .any(|method| method == "generateContent")
+                })
+                .map(|model| bare_name(&model.name).to_string())
+                .filter(|name| !name.is_empty()),
+        );
+        match page.next_page_token {
+            Some(token) if !token.is_empty() => page_token = Some(token),
+            _ => break,
+        }
+    }
+    Ok(ModelCatalog { names })
+}
+
+/// One page; errors may hold the key until the caller scrubs them.
+async fn fetch_page(
+    client: &reqwest::Client,
+    url: &str,
+    query: &[(&str, String)],
+    api_key: &str,
+) -> Result<ModelsPage, String> {
+    let response = client
+        .get(url)
+        .query(query)
+        .header("x-goog-api-key", api_key)
+        .send()
+        .await
+        .map_err(|e| format!("gemini: listing models: {}", e.without_url()))?;
+    let status = response.status();
+    let body = response
+        .bytes()
+        .await
+        .map_err(|e| format!("gemini: listing models: {}", e.without_url()))?;
+    if !status.is_success() {
+        let text: String = String::from_utf8_lossy(&body)
+            .chars()
+            .take(ERROR_BODY_CHARS)
+            .collect();
+        return Err(format!(
+            "gemini: listing models: HTTP {status}: {}",
+            text.trim()
+        ));
+    }
+    serde_json::from_slice(&body).map_err(|e| format!("gemini: listing models: bad JSON: {e}"))
 }
 
 /// A name trimmed and without a leading `models/`.
@@ -627,5 +750,123 @@ mod tests {
             ModelChoice::Named("ultra:newest".into())
         );
         assert_eq!(ModelChoice::parse(""), ModelChoice::Named(String::new()));
+    }
+
+    /// A local HTTP server that answers each request with the next of
+    /// `responses` (status, body) and records each request's head.
+    struct TestServer {
+        base: String,
+        requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
+        thread: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl TestServer {
+        fn start(responses: Vec<(u16, String)>) -> TestServer {
+            use std::io::{Read, Write};
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let base = format!("http://{}/v1beta", listener.local_addr().unwrap());
+            let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+            let seen = requests.clone();
+            let thread = std::thread::spawn(move || {
+                for (status, body) in responses {
+                    let (mut stream, _) = listener.accept().unwrap();
+                    let mut head = Vec::new();
+                    let mut byte = [0u8; 1];
+                    while !head.ends_with(b"\r\n\r\n") {
+                        if stream.read(&mut byte).unwrap() == 0 {
+                            break;
+                        }
+                        head.push(byte[0]);
+                    }
+                    seen.lock()
+                        .unwrap()
+                        .push(String::from_utf8_lossy(&head).into_owned());
+                    let reply = format!(
+                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
+                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                        body.len()
+                    );
+                    stream.write_all(reply.as_bytes()).unwrap();
+                }
+            });
+            TestServer {
+                base,
+                requests,
+                thread: Some(thread),
+            }
+        }
+
+        fn requests(mut self) -> Vec<String> {
+            self.thread.take().unwrap().join().unwrap();
+            self.requests.lock().unwrap().clone()
+        }
+    }
+
+    const KEY: &str = "test-key-SECRET-123";
+
+    #[tokio::test]
+    async fn fetch_reads_every_page_and_keeps_generate_content_models() {
+        let page1 = r#"{"models": [
+            {"name": "models/gemini-2.5-flash", "displayName": "Gemini 2.5 Flash",
+             "version": "001", "supportedGenerationMethods": ["generateContent", "countTokens"]},
+            {"name": "models/text-embedding-004", "displayName": "Text Embedding 004",
+             "version": "004", "supportedGenerationMethods": ["embedContent"]}
+        ], "nextPageToken": "page 2/token"}"#;
+        let page2 = r#"{"models": [
+            {"name": "models/gemini-2.0-flash-lite", "displayName": "Gemini 2.0 Flash-Lite",
+             "version": "2.0", "supportedGenerationMethods": ["generateContent"]},
+            {"name": "models/aqa", "displayName": "AQA", "version": "001"}
+        ]}"#;
+        let server = TestServer::start(vec![(200, page1.into()), (200, page2.into())]);
+        let catalog = fetch_from(&server.base, KEY).await.unwrap();
+        assert_eq!(
+            catalog.names(),
+            vec!["gemini-2.0-flash-lite", "gemini-2.5-flash"]
+        );
+        let requests = server.requests();
+        assert_eq!(requests.len(), 2);
+        assert!(requests[0].starts_with("GET /v1beta/models?pageSize=1000 HTTP/1.1"));
+        assert!(
+            requests[1].starts_with("GET /v1beta/models?pageSize=1000&pageToken=page+2%2Ftoken ")
+        );
+        for request in &requests {
+            assert!(
+                request
+                    .to_ascii_lowercase()
+                    .contains(&format!("x-goog-api-key: {}", KEY.to_ascii_lowercase()))
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn fetch_gives_an_http_error_without_the_key() {
+        let body = format!(
+            r#"{{"error": {{"code": 403, "message": "API key {KEY} not valid", "status": "PERMISSION_DENIED"}}}}"#
+        );
+        let server = TestServer::start(vec![(403, body)]);
+        let error = fetch_from(&server.base, KEY).await.unwrap_err();
+        server.requests();
+        assert!(error.contains("HTTP 403"), "{error}");
+        assert!(error.contains("PERMISSION_DENIED"), "{error}");
+        assert!(!error.contains(KEY), "{error}");
+    }
+
+    #[tokio::test]
+    async fn fetch_gives_bad_json_as_an_error_without_the_key() {
+        let server = TestServer::start(vec![(200, format!("{{\"models\": [{KEY}"))]);
+        let error = fetch_from(&server.base, KEY).await.unwrap_err();
+        server.requests();
+        assert!(error.contains("bad JSON"), "{error}");
+        assert!(!error.contains(KEY), "{error}");
+    }
+
+    #[tokio::test]
+    async fn fetch_gives_a_connection_failure_as_an_error() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let base = format!("http://{}/v1beta", listener.local_addr().unwrap());
+        drop(listener);
+        let error = fetch_from(&base, KEY).await.unwrap_err();
+        assert!(error.starts_with("gemini: listing models"), "{error}");
+        assert!(!error.contains(KEY), "{error}");
     }
 }
