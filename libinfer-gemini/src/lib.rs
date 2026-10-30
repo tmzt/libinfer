@@ -16,7 +16,9 @@ pub use gemini_rust::{
     Message as GeminiMessage, Model, Role, Tool,
 };
 
-pub use choice::{Age, How, ModelCatalog, ModelChoice, Resolved, Tier, resolve_offline};
+pub use choice::{
+    Age, How, ModelCatalog, ModelChoice, OLDEST_FLOOR, Resolved, Tier, resolve_offline,
+};
 
 /// The default number of tool-calling steps allowed in one turn.
 pub const DEFAULT_MAX_TURNS: usize = 5;

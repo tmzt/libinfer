@@ -26,6 +26,14 @@ const FETCH_TIMEOUT: Duration = Duration::from_secs(30);
 /// The most of an error response's body kept in an error.
 const ERROR_BODY_CHARS: usize = 300;
 
+/// The lowest version *oldest* may pick, as `(major, minor)`: 3.0, the
+/// first 3.x model. A model can be in the key's list and still be refused
+/// ("no longer available to new users"), as `gemini-2.5-flash-lite` was, so
+/// versions below this never count for [`Age::Oldest`]. [`Age::Newest`] and
+/// [`ModelChoice::Named`] do not use it: a named model below the floor is
+/// used as given.
+pub const OLDEST_FLOOR: (u64, u64) = (3, 0);
+
 /// A Gemini model's level.
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 #[non_exhaustive]
@@ -71,7 +79,9 @@ impl fmt::Display for Tier {
 pub enum Age {
     /// The newest served version: the best, at a higher cost.
     Newest,
-    /// The oldest version still served: the cheapest.
+    /// The oldest stable version served at or above [`OLDEST_FLOOR`]
+    /// (3.0): the cheapest that new keys are still given. With none at or
+    /// above the floor, the choice falls back to [`DEFAULT_MODEL`].
     Oldest,
 }
 
@@ -246,7 +256,8 @@ impl ModelCatalog {
             .names
             .iter()
             .filter_map(|name| StableName::parse(name).map(|parsed| (parsed, name)))
-            .filter(|(parsed, _)| parsed.tier == tier);
+            .filter(|(parsed, _)| parsed.tier == tier)
+            .filter(|(parsed, _)| age != Age::Oldest || parsed.at_or_above_floor());
         let picked = match age {
             Age::Newest => stable.max_by_key(|(parsed, _)| parsed.newest_key()),
             Age::Oldest => stable.min_by_key(|(parsed, _)| parsed.oldest_key()),
@@ -288,6 +299,18 @@ fn log_resolution(choice: &ModelChoice, resolved: &Resolved, listed: bool) {
         }
         How::Fallback => {
             let why = match (choice, listed) {
+                (
+                    ModelChoice::Rule {
+                        tier,
+                        age: Age::Oldest,
+                    },
+                    true,
+                ) => {
+                    let (major, minor) = OLDEST_FLOOR;
+                    format!(
+                        "no served {tier} model at or above {major}.{minor} in the key's model list"
+                    )
+                }
                 (ModelChoice::Rule { tier, .. }, true) => {
                     format!("no served {tier} model in the key's model list")
                 }
@@ -460,6 +483,11 @@ impl StableName {
         )
     }
 
+    /// Whether the version is at or above [`OLDEST_FLOOR`].
+    fn at_or_above_floor(&self) -> bool {
+        (self.major, self.minor) >= OLDEST_FLOOR
+    }
+
     /// Lowest version wins; among one version, no revision beats any
     /// revision, then the lowest revision.
     fn oldest_key(&self) -> (u64, u64, bool, u64) {
@@ -491,6 +519,9 @@ mod tests {
         "models/gemini-2.5-pro",
         "models/gemini-3.8-flash",
         "models/gemini-3.8-flash-preview",
+        "models/gemini-3.0-flash-lite",
+        "models/gemini-3.5-flash-lite",
+        "models/gemini-3.1-pro",
         "models/gemini-2.5-flash-001",
         "models/gemini-flash-latest",
         "models/text-embedding-004",
@@ -520,32 +551,32 @@ mod tests {
         );
         assert_eq!(
             catalog.resolve(&rule(Tier::Flash, Age::Oldest)),
-            resolved("gemini-2.0-flash", How::Matched)
+            resolved("gemini-3.8-flash", How::Matched)
         );
         assert_eq!(
             catalog.resolve(&rule(Tier::FlashLite, Age::Newest)),
-            resolved("gemini-2.5-flash-lite", How::Matched)
+            resolved("gemini-3.5-flash-lite", How::Matched)
         );
         assert_eq!(
             catalog.resolve(&rule(Tier::FlashLite, Age::Oldest)),
-            resolved("gemini-2.0-flash-lite", How::Matched)
+            resolved("gemini-3.0-flash-lite", How::Matched)
         );
         assert_eq!(
             catalog.resolve(&rule(Tier::Pro, Age::Newest)),
-            resolved("gemini-2.5-pro", How::Matched)
+            resolved("gemini-3.1-pro", How::Matched)
         );
         assert_eq!(
             catalog.resolve(&rule(Tier::Pro, Age::Oldest)),
-            resolved("gemini-2.5-pro", How::Matched)
+            resolved("gemini-3.1-pro", How::Matched)
         );
     }
 
     #[test]
     fn flash_lite_is_never_read_as_flash() {
-        let catalog = ModelCatalog::from_names(["gemini-1.5-flash-lite", "gemini-2.0-flash"]);
+        let catalog = ModelCatalog::from_names(["gemini-3.0-flash-lite", "gemini-3.5-flash"]);
         assert_eq!(
             catalog.resolve(&rule(Tier::Flash, Age::Oldest)).model,
-            "gemini-2.0-flash"
+            "gemini-3.5-flash"
         );
         let only_lite = ModelCatalog::from_names(["gemini-2.0-flash-lite"]);
         assert_eq!(
@@ -557,7 +588,8 @@ mod tests {
     #[test]
     fn previews_and_other_suffixes_are_skipped() {
         let catalog = ModelCatalog::from_names([
-            "gemini-2.5-flash",
+            "gemini-3.5-flash",
+            "gemini-3.0-flash-preview",
             "gemini-3.8-flash-preview",
             "gemini-4.0-flash-exp-0827",
             "gemini-4.0-flash-tts",
@@ -569,11 +601,11 @@ mod tests {
         ]);
         assert_eq!(
             catalog.resolve(&rule(Tier::Flash, Age::Newest)),
-            resolved("gemini-2.5-flash", How::Matched)
+            resolved("gemini-3.5-flash", How::Matched)
         );
         assert_eq!(
             catalog.resolve(&rule(Tier::Flash, Age::Oldest)),
-            resolved("gemini-2.5-flash", How::Matched)
+            resolved("gemini-3.5-flash", How::Matched)
         );
         // Without the alias, newest Flash in the plan's list is the
         // stable 3.8, not the preview.
@@ -601,7 +633,7 @@ mod tests {
     fn the_alias_is_preferred_for_newest_only() {
         let catalog = ModelCatalog::from_names([
             "gemini-flash-lite-latest",
-            "gemini-2.0-flash-lite",
+            "gemini-3.0-flash-lite",
             "gemini-9.9-flash-lite",
         ]);
         assert_eq!(
@@ -610,7 +642,7 @@ mod tests {
         );
         assert_eq!(
             catalog.resolve(&rule(Tier::FlashLite, Age::Oldest)),
-            resolved("gemini-2.0-flash-lite", How::Matched)
+            resolved("gemini-3.0-flash-lite", How::Matched)
         );
         // Only the alias: oldest has no versioned model to pick.
         let only_alias = ModelCatalog::from_names(["gemini-pro-latest"]);
@@ -623,40 +655,40 @@ mod tests {
     #[test]
     fn revisions_order_within_a_version() {
         let catalog = ModelCatalog::from_names([
-            "gemini-2.5-flash-002",
-            "gemini-2.5-flash-001",
-            "gemini-2.5-flash",
+            "gemini-3.5-flash-002",
+            "gemini-3.5-flash-001",
+            "gemini-3.5-flash",
         ]);
         assert_eq!(
             catalog.resolve(&rule(Tier::Flash, Age::Newest)).model,
-            "gemini-2.5-flash"
+            "gemini-3.5-flash"
         );
         assert_eq!(
             catalog.resolve(&rule(Tier::Flash, Age::Oldest)).model,
-            "gemini-2.5-flash"
+            "gemini-3.5-flash"
         );
         let revisions_only =
-            ModelCatalog::from_names(["gemini-2.5-flash-002", "gemini-2.5-flash-001"]);
+            ModelCatalog::from_names(["gemini-3.5-flash-002", "gemini-3.5-flash-001"]);
         assert_eq!(
             revisions_only
                 .resolve(&rule(Tier::Flash, Age::Newest))
                 .model,
-            "gemini-2.5-flash-002"
+            "gemini-3.5-flash-002"
         );
         assert_eq!(
             revisions_only
                 .resolve(&rule(Tier::Flash, Age::Oldest))
                 .model,
-            "gemini-2.5-flash-001"
+            "gemini-3.5-flash-001"
         );
     }
 
     #[test]
     fn versions_compare_numerically() {
         let catalog = ModelCatalog::from_names([
-            "gemini-2-flash",
-            "gemini-2.10-flash",
-            "gemini-2.9-flash",
+            "gemini-3-flash",
+            "gemini-3.10-flash",
+            "gemini-3.9-flash",
             "gemini-10.0-flash",
         ]);
         assert_eq!(
@@ -665,7 +697,96 @@ mod tests {
         );
         assert_eq!(
             catalog.resolve(&rule(Tier::Flash, Age::Oldest)).model,
-            "gemini-2-flash"
+            "gemini-3-flash"
+        );
+    }
+
+    #[test]
+    fn the_floor_is_the_first_3x_model() {
+        assert_eq!(OLDEST_FLOOR, (3, 0));
+    }
+
+    #[test]
+    fn oldest_picks_the_lowest_version_at_or_above_the_floor() {
+        let catalog = ModelCatalog::from_names([
+            "gemini-2.0-flash-lite",
+            "gemini-2.5-flash-lite",
+            "gemini-3.2-flash-lite",
+            "gemini-3.0-flash-lite-001",
+            "gemini-4.0-flash-lite",
+        ]);
+        assert_eq!(
+            catalog.resolve(&rule(Tier::FlashLite, Age::Oldest)),
+            resolved("gemini-3.0-flash-lite-001", How::Matched)
+        );
+    }
+
+    #[test]
+    fn oldest_with_only_versions_below_the_floor_falls_back() {
+        let catalog = ModelCatalog::from_names([
+            "gemini-2.0-flash-lite",
+            "gemini-2.5-flash-lite",
+            "gemini-3.5-flash",
+        ]);
+        let lines = captured(|| {
+            assert_eq!(
+                catalog.resolve(&rule(Tier::FlashLite, Age::Oldest)),
+                resolved(DEFAULT_MODEL, How::Fallback)
+            );
+        });
+        assert_eq!(
+            lines,
+            vec![(
+                log::Level::Warn,
+                format!(
+                    "gemini: flash-lite:oldest: no served flash-lite model at or above 3.0 \
+                     in the key's model list; using {DEFAULT_MODEL}"
+                )
+            )]
+        );
+    }
+
+    #[test]
+    fn the_owners_list_gives_the_first_3x_flash_lite_for_oldest() {
+        let catalog = ModelCatalog::from_names([
+            "models/gemini-2.5-flash-lite",
+            "models/gemini-3.5-flash-lite",
+            "models/gemini-3.8-flash-lite",
+            "models/gemini-flash-lite-latest",
+        ]);
+        assert_eq!(
+            catalog.resolve(&rule(Tier::FlashLite, Age::Oldest)),
+            resolved("gemini-3.5-flash-lite", How::Matched)
+        );
+        assert_eq!(
+            catalog.resolve(&rule(Tier::FlashLite, Age::Newest)),
+            resolved("gemini-flash-lite-latest", How::Alias)
+        );
+    }
+
+    #[test]
+    fn newest_is_unaffected_by_the_floor() {
+        let catalog = ModelCatalog::from_names(["gemini-2.0-flash", "gemini-2.5-flash"]);
+        assert_eq!(
+            catalog.resolve(&rule(Tier::Flash, Age::Newest)),
+            resolved("gemini-2.5-flash", How::Matched)
+        );
+        assert_eq!(
+            catalog.resolve(&rule(Tier::Flash, Age::Oldest)),
+            resolved(DEFAULT_MODEL, How::Fallback)
+        );
+    }
+
+    #[test]
+    fn a_named_model_below_the_floor_is_used_as_given() {
+        let catalog = ModelCatalog::from_names(["gemini-2.5-flash-lite", "gemini-3.5-flash-lite"]);
+        assert_eq!(
+            catalog.resolve(&ModelChoice::Named("gemini-2.5-flash-lite".into())),
+            resolved("gemini-2.5-flash-lite", How::Named)
+        );
+        assert_eq!(
+            resolve_offline(&ModelChoice::Named("gemini-2.0-flash".into())),
+            resolved("gemini-2.0-flash", How::Named)
         );
     }
 
@@ -960,7 +1081,7 @@ mod tests {
             lines,
             vec![(
                 log::Level::Info,
-                "gemini: flash-lite:oldest is gemini-2.0-flash-lite".to_string()
+                "gemini: flash-lite:oldest is gemini-3.0-flash-lite".to_string()
             )]
         );
         let lines = captured(|| {

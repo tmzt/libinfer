@@ -1,7 +1,7 @@
 ---
 title: Gemini model choice by tier and age, resolved against the account's models
 date: 2026-10-30
-status: Implemented
+status: In implementation
 covers:
   - "A `ModelChoice` in libinfer-gemini: a model asked for by its tier
     (Flash-Lite, Flash, Pro) and its age (newest or oldest still served),
@@ -336,3 +336,10 @@ oldest") and adds to decision 4:
    *oldest*, behaviour a caller observes, so it is not strictly additive
    (Rule 5.4): libinfer-gemini 0.2.0, its `VERSIONS.md` entry marked
    **Breaking (behaviour)**, tag `v0.2.0`. `OLDEST_FLOOR` is public.
+
+## Amendment — 2026-10-30 15:26 EDT: back in implementation for the floor; the document is immutable again
+
+The status returns from `Implemented` to `In implementation` for the
+2026-10-30 15:23 EDT amendment (a floor for *oldest*: the first 3.x
+model). The document stays immutable; it returns to `Implemented` when
+that amendment is built.
