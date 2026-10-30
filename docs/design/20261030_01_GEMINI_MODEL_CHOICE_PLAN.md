@@ -1,7 +1,7 @@
 ---
 title: Gemini model choice by tier and age, resolved against the account's models
 date: 2026-10-30
-status: Draft
+status: In implementation
 covers:
   - "A `ModelChoice` in libinfer-gemini: a model asked for by its tier
     (Flash-Lite, Flash, Pro) and its age (newest or oldest still served),
@@ -286,3 +286,9 @@ Section 7 has no open questions left; the rest of the plan is unchanged.
 The owner approved the plan as it stands at commit `527a838` (2026-10-30:
 "Approve plan 527a838"). The status stays `Draft` until its first
 implementing commit sets `In implementation` (Rule 1.5).
+
+## Amendment — 2026-10-30 13:56 EDT: implementation started; the document is now immutable
+
+Implementation started on the owner's approval at `527a838`, with step 1
+(the types and the match). The status is `In implementation`, and the
+document is now immutable (Rule 1.5).

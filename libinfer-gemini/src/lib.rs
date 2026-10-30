@@ -5,6 +5,8 @@
 //! Until tools are provider-neutral (that plan's step 4), the engine takes
 //! `gemini-rust` types, which this crate re-exports.
 
+mod choice;
+
 use async_compat::CompatExt;
 use async_trait::async_trait;
 use libinfer::{Message, ReasoningEngine, ToolExecutor};
@@ -13,6 +15,8 @@ pub use gemini_rust::{
     Content, FunctionCall, FunctionCallingMode, FunctionDeclaration, Gemini,
     Message as GeminiMessage, Model, Role, Tool,
 };
+
+pub use choice::{Age, How, ModelCatalog, ModelChoice, Resolved, Tier, resolve_offline};
 
 /// The default number of tool-calling steps allowed in one turn.
 pub const DEFAULT_MAX_TURNS: usize = 5;
