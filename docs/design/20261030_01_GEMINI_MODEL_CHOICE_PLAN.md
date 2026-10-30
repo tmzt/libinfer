@@ -1,7 +1,7 @@
 ---
 title: Gemini model choice by tier and age, resolved against the account's models
 date: 2026-10-30
-status: In implementation
+status: Implemented
 covers:
   - "A `ModelChoice` in libinfer-gemini: a model asked for by its tier
     (Flash-Lite, Flash, Pro) and its age (newest or oldest still served),
@@ -292,3 +292,19 @@ implementing commit sets `In implementation` (Rule 1.5).
 Implementation started on the owner's approval at `527a838`, with step 1
 (the types and the match). The status is `In implementation`, and the
 document is now immutable (Rule 1.5).
+
+## Amendment — 2026-10-30 13:58 EDT: implemented
+
+Every step is done, and the status is `Implemented` (Rule 1.3). The
+commits, on the `model-choice` branch:
+
+1. **The types and the match:** `11b35e6` (`libinfer-gemini/src/choice.rs`,
+   re-exported from the crate root; this commit also set
+   `In implementation`).
+2. **Fetching the list:** `bdfb5fa` (`ModelCatalog::fetch`, with
+   `reqwest` 0.12 on `rustls-tls` only, the TLS `gemini-rust` 1.7.1
+   enables; no new packages in `Cargo.lock`).
+3. **Logging:** `f2d8d36`.
+4. **The release:** `ec249c5` (libinfer-gemini 0.1.1 and its
+   `VERSIONS.md` entry). The tag `v0.1.1` goes on `ec249c5` when the
+   branch lands; the owner tags it.
