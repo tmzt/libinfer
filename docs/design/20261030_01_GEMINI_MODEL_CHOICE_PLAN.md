@@ -308,3 +308,31 @@ commits, on the `model-choice` branch:
 4. **The release:** `ec249c5` (libinfer-gemini 0.1.1 and its
    `VERSIONS.md` entry). The tag `v0.1.1` goes on `ec249c5` when the
    branch lands; the owner tags it.
+
+## Amendment — 2026-10-30 15:23 EDT: a floor for *oldest*: the first 3.x model
+
+On the owner's instruction (2026-10-30): "right, set a floor on the first
+3.x model, we could add a ForceOldest (assuming the user has grandfathered
+access) but that might be too much". The reason: a model can be in the
+key's list and still be refused. flankr's summaries resolved
+`flash-lite:oldest` to `gemini-2.5-flash-lite`, which the API listed but
+refused: "This model models/gemini-2.5-flash-lite is no longer available
+to new users. Please update your code to use models/gemini-3.5-flash-lite".
+This replaces the 13:53 EDT amendment's answer 3 ("no version floor for
+oldest") and adds to decision 4:
+
+1. **The floor.** `OLDEST_FLOOR` is version 3.0. *Oldest* picks the
+   stable model of the tier with the lowest version **at or above** the
+   floor, by decision 4's ordering. Versions below it never count for
+   *oldest*.
+2. **Nothing at or above the floor** in the tier: *oldest* falls back to
+   `DEFAULT_MODEL` (decision 5), with the usual warning naming the
+   choice.
+3. **Newest and named choices** are unchanged. A `Named` model below the
+   floor is still used as given.
+4. **No ForceOldest.** An age that ignores the floor, for keys with older
+   access, is left out for now.
+5. **Release.** This changes what `ModelCatalog::resolve` returns for
+   *oldest*, behaviour a caller observes, so it is not strictly additive
+   (Rule 5.4): libinfer-gemini 0.2.0, its `VERSIONS.md` entry marked
+   **Breaking (behaviour)**, tag `v0.2.0`. `OLDEST_FLOOR` is public.
