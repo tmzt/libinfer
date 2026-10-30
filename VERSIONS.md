@@ -19,3 +19,17 @@ Initial release, extracted from flankr (`crates/libinfer`).
 `libinfer-gemini`:
 - `GeminiReasoningEngine`, `GeminiReasoningEngineBuilder`.
 - Re-exports of `gemini-rust` 1.7 types (`Content`, `FunctionCall`, `FunctionCallingMode`, `FunctionDeclaration`, `Gemini`, `Message`, `Model`, `Role`, `Tool`).
+
+## 0.1.1 — 2026-10-30 (`f2d8d36`, tag `v0.1.1`)
+
+`libinfer-gemini` only (`libinfer` stays 0.1.0). Strictly additive: a
+Gemini model asked for by tier and age, resolved against the key's model
+list (docs/design/20261030_01_GEMINI_MODEL_CHOICE_PLAN.md).
+
+`libinfer-gemini`:
+- Added `Tier` (`FlashLite`, `Flash`, `Pro`) and `Age` (`Newest`, `Oldest`), both `#[non_exhaustive]`, with `Display`.
+- Added `ModelChoice` (`Rule { tier, age }`, `Named(String)`; `#[non_exhaustive]`), with `ModelChoice::parse` and `Display` for the text form `<tier>:<age>` (`flash-lite:oldest`).
+- Added `ModelCatalog`, with `fetch` (the key's `generateContent` models, every page), `from_names`, `resolve` and `names`.
+- Added `Resolved` (`model`, `how`; `#[non_exhaustive]`) and `How` (`Alias`, `Matched`, `Named`, `NamedMissing`, `Fallback`; `#[non_exhaustive]`).
+- Added `resolve_offline`.
+- `DEFAULT_MODEL` and `model_from_name` are unchanged.
