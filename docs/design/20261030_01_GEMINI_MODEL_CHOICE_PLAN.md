@@ -265,3 +265,18 @@ crate's existing `async-compat` use.
 3. **Oldest and quality:** should *oldest* have a floor (for example
    never below version 2.0), so a very old model left in the list is not
    chosen?
+
+## Amendment — 2026-10-30 13:53 EDT: the open questions answered
+
+The owner (2026-10-30) agreed to the proposed answers to section 7:
+
+1. **Pro stays a tier.** `Tier::Pro` is kept, so a config may ask for
+   `pro:newest` or `pro:oldest`; no default uses it.
+2. **Newest never picks a preview.** A `-preview` (or any other
+   non-stable suffix) never matches a rule, as decision 3 says; a tier
+   with no stable model and no `-latest` alias falls back to
+   `DEFAULT_MODEL` (decision 5).
+3. **No version floor for oldest.** *Oldest* is the lowest stable version
+   listed, whatever it is.
+
+Section 7 has no open questions left; the rest of the plan is unchanged.
