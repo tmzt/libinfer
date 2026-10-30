@@ -33,3 +33,13 @@ list (docs/design/20261030_01_GEMINI_MODEL_CHOICE_PLAN.md).
 - Added `Resolved` (`model`, `how`; `#[non_exhaustive]`) and `How` (`Alias`, `Matched`, `Named`, `NamedMissing`, `Fallback`; `#[non_exhaustive]`).
 - Added `resolve_offline`.
 - `DEFAULT_MODEL` and `model_from_name` are unchanged.
+
+## 0.2.0 — 2026-10-30 (`3641ed2`, tag `v0.2.0`)
+
+`libinfer-gemini` only (`libinfer` stays 0.1.0). A floor for *oldest*
+(docs/design/20261030_01_GEMINI_MODEL_CHOICE_PLAN.md, the 2026-10-30
+15:23 EDT amendment).
+
+`libinfer-gemini`:
+- **Breaking (behaviour):** `ModelCatalog::resolve` for `Age::Oldest` picks the lowest stable version at or above `OLDEST_FLOOR` (3.0); versions below it never count, and a tier with none at or above the floor resolves to `DEFAULT_MODEL` (`How::Fallback`). `Age::Newest` and `ModelChoice::Named` are unchanged.
+- Added `OLDEST_FLOOR: (u64, u64)`, the floor as `(major, minor)`.
