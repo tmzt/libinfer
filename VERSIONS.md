@@ -43,3 +43,15 @@ list (docs/design/20261030_01_GEMINI_MODEL_CHOICE_PLAN.md).
 `libinfer-gemini`:
 - **Breaking (behaviour):** `ModelCatalog::resolve` for `Age::Oldest` picks the lowest stable version at or above `OLDEST_FLOOR` (3.0); versions below it never count, and a tier with none at or above the floor resolves to `DEFAULT_MODEL` (`How::Fallback`). `Age::Newest` and `ModelChoice::Named` are unchanged.
 - Added `OLDEST_FLOOR: (u64, u64)`, the floor as `(major, minor)`.
+
+## 0.2.1 — 2026-10-30 (`eeb80da`, tag `v0.2.1`)
+
+`libinfer-gemini` only (`libinfer` stays 0.1.0). Strictly additive: a
+refused model is replaced by the policy's next choice
+(docs/design/20261030_01_GEMINI_MODEL_CHOICE_PLAN.md, the 2026-10-30
+15:37 EDT amendment).
+
+`libinfer-gemini`:
+- Added `GeminiReasoningEngineBuilder::choice(choice: ModelChoice, catalog: &ModelCatalog)`: the engine resolves the choice and keeps it with the catalog; when the API refuses its model (HTTP 404, `NOT_FOUND`, naming the model), a rule moves to its next choice (or Google's suggestion, if it fits the rule) and the request is sent again, at most 3 times per engine. A `Named` choice never switches.
+- Added `GeminiReasoningEngine::current_model() -> Model`, the model requests go to now.
+- `GeminiReasoningEngineBuilder::model`, `GeminiReasoningEngine::model` (the model the engine was built with) and every existing behaviour are unchanged.
