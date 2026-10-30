@@ -356,3 +356,48 @@ branch:
 2. **The release** (item 5): `2034383` (libinfer-gemini 0.2.0 and its
    `VERSIONS.md` entry, marked **Breaking (behaviour)**). The tag
    `v0.2.0` goes on `2034383` when the branch lands; the owner tags it.
+
+## Amendment — 2026-10-30 15:37 EDT: a refused model is replaced by the policy's next choice
+
+On the owner's instruction (2026-10-30), after the floor: "yes, it should
+bump the version selection when it gets that error, if that can happen in
+the initial call or on the first actual call without requiring additional
+client code"; then, told that stepping by our own order needs the engine to
+hold the choice and the list: "it should validate Google's suggestion
+against the policy (if it pushes 3.8 but 3.6 is in the list, it should use
+3.6)"; then "Yes, add the floor check to the libinfer plan". A model can be
+listed and still refused ("This model models/<name> is no longer available
+to new users. Please update your code to use models/<suggested>"). This
+adds:
+
+1. **The builder takes a choice.** `GeminiReasoningEngineBuilder::choice(
+   choice: ModelChoice, catalog: &ModelCatalog) -> Self` (additive). It
+   resolves the choice against the catalog for the first model, as
+   `ModelCatalog::resolve` does, and keeps the choice and a copy of the
+   catalog in the engine. `model(name)` is unchanged and never switches.
+2. **A refusal.** When a request answers HTTP 404 with status `NOT_FOUND`
+   naming the engine's model, the engine marks that model refused (for its
+   life) and picks again by the policy, without the refused models:
+   - **a rule** (`Rule { tier, age }`): the next model the same rule picks
+     from the catalog with the refused ones left out: for *oldest*, the
+     next lowest stable version at or above `OLDEST_FLOOR`; for *newest*,
+     the next highest (after the `-latest` alias, if that was refused);
+   - **Google's suggestion** (the `models/<name>` after "use" in the
+     message) is taken only when the rule has nothing left, and only if it
+     is the same tier, stable, and, for *oldest*, at or above the floor;
+   - **a named choice** never switches: the error is returned as now.
+3. **Retried once per switch,** at most 3 switches for the engine's life;
+   the request is sent again on the new model, and the caller sees its
+   answer. With nothing left, the 404 is returned as now.
+4. **Logged:** one `warn` per switch, naming the refused model, the new
+   one and how it was chosen (`policy` or `suggested`), never the key.
+5. **Release.** Additive (a new builder method; `model()` and every
+   existing behaviour unchanged): libinfer-gemini 0.2.1, tag `v0.2.1`.
+6. **Adoption** (flankr, its own amendment): the daemon builds its clients
+   with `.choice(choice, &catalog)` where it now passes the resolved name.
+7. **Tests** against the local test server: a refused *oldest* model steps
+   to the next 3.x one, not to Google's suggestion when the list has a
+   lower one (the owner's case: suggested 3.8, 3.6 listed, 3.6 used);
+   Google's suggestion used when the rule has nothing left, and refused
+   when below the floor or another tier; a named model not switched; at
+   most 3 switches; the key in no log line.
