@@ -1,7 +1,7 @@
 ---
 title: Gemini model choice by tier and age, resolved against the account's models
 date: 2026-10-30
-status: In implementation
+status: Implemented
 covers:
   - "A `ModelChoice` in libinfer-gemini: a model asked for by its tier
     (Flash-Lite, Flash, Pro) and its age (newest or oldest still served),
@@ -415,3 +415,22 @@ The status returns from `Implemented` to `In implementation` for the
 2026-10-30 15:37 EDT amendment (a refused model is replaced by the
 policy's next choice), approved at 15:39 EDT. The document stays
 immutable; it returns to `Implemented` when that amendment is built.
+
+## Amendment — 2026-10-30 15:46 EDT: implemented again
+
+The 2026-10-30 15:37 EDT amendment (a refused model is replaced by the
+policy's next choice) is built; the status returns to `Implemented`. The
+commits, on the `refused` branch:
+
+1. **The builder, the refusal, the retry, the log and the tests**
+   (items 1 to 4 and 7): `eeb80da` (`GeminiReasoningEngineBuilder::choice`
+   and the refusal handling in `libinfer-gemini/src/lib.rs`,
+   `ModelCatalog`'s next choice in `libinfer-gemini/src/choice.rs`, the
+   shared test server in `libinfer-gemini/src/testutil.rs`; this commit
+   also set `In implementation`). Small departures are recorded in
+   `CHANGES.md` (`28e2367`).
+2. **The release** (item 5): `a4b2fc3` (libinfer-gemini 0.2.1 and its
+   `VERSIONS.md` entry). The tag `v0.2.1` goes on `a4b2fc3` when the
+   branch lands; the owner tags it.
+
+Item 6 (flankr's adoption) is flankr's own amendment.

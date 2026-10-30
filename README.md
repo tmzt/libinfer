@@ -11,4 +11,4 @@ The workspace consists of:
 | Document | Date | Status | Decision |
 | --- | --- | --- | --- |
 | None | 2026-10-25 | Implemented | Initial repository extraction from flankr. |
-| [Gemini model choice by tier and age](docs/design/20261030_01_GEMINI_MODEL_CHOICE_PLAN.md) | 2026-10-30 | In implementation | A model asked for by tier (Flash-Lite, Flash, Pro) and age (newest or oldest served), resolved once against the key's model list; built in libinfer-gemini 0.1.1, with a 3.0 floor on oldest in 0.2.0; back in implementation for replacing a refused model. |
+| [Gemini model choice by tier and age](docs/design/20261030_01_GEMINI_MODEL_CHOICE_PLAN.md) | 2026-10-30 | Implemented | A model asked for by tier (Flash-Lite, Flash, Pro) and age (newest or oldest served), resolved once against the key's model list; built in libinfer-gemini 0.1.1, with a 3.0 floor on oldest in 0.2.0 and a refused model replaced by the rule's next choice in 0.2.1. |
