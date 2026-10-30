@@ -280,3 +280,9 @@ The owner (2026-10-30) agreed to the proposed answers to section 7:
    listed, whatever it is.
 
 Section 7 has no open questions left; the rest of the plan is unchanged.
+
+## Amendment — 2026-10-30 13:53 EDT: approved
+
+The owner approved the plan as it stands at commit `527a838` (2026-10-30:
+"Approve plan 527a838"). The status stays `Draft` until its first
+implementing commit sets `In implementation` (Rule 1.5).
