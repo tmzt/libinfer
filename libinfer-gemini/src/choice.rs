@@ -243,18 +243,34 @@ impl ModelCatalog {
     }
 
     fn resolve_rule(&self, tier: Tier, age: Age) -> Resolved {
+        match self.pick_rule(tier, age, &[]) {
+            Some((model, how)) => Resolved { model, how },
+            None => fallback(),
+        }
+    }
+
+    /// The model the rule picks with the `refused` names left out, and how,
+    /// or `None` when the tier has nothing left: decision 4 with the floor,
+    /// without the fallback and without logging. The refused-model
+    /// amendment's next choice: for *oldest* the next lowest stable version
+    /// at or above the floor, for *newest* the next highest after the alias.
+    pub(crate) fn pick_rule(
+        &self,
+        tier: Tier,
+        age: Age,
+        refused: &[String],
+    ) -> Option<(String, How)> {
+        let allowed = |name: &String| !refused.iter().any(|r| r == name);
         if age == Age::Newest {
             let alias = format!("gemini-{}-latest", tier.as_str());
-            if self.names.contains(&alias) {
-                return Resolved {
-                    model: alias,
-                    how: How::Alias,
-                };
+            if self.names.contains(&alias) && allowed(&alias) {
+                return Some((alias, How::Alias));
             }
         }
         let stable = self
             .names
             .iter()
+            .filter(|name| allowed(name))
             .filter_map(|name| StableName::parse(name).map(|parsed| (parsed, name)))
             .filter(|(parsed, _)| parsed.tier == tier)
             .filter(|(parsed, _)| age != Age::Oldest || parsed.at_or_above_floor());
@@ -262,13 +278,17 @@ impl ModelCatalog {
             Age::Newest => stable.max_by_key(|(parsed, _)| parsed.newest_key()),
             Age::Oldest => stable.min_by_key(|(parsed, _)| parsed.oldest_key()),
         };
-        match picked {
-            Some((_, name)) => Resolved {
-                model: name.clone(),
-                how: How::Matched,
-            },
-            None => fallback(),
-        }
+        picked.map(|(_, name)| (name.clone(), How::Matched))
+    }
+}
+
+/// Whether Google's suggested replacement `name` may stand in for the rule
+/// `tier`/`age`: the same tier, stable, and for *oldest* at or above
+/// [`OLDEST_FLOOR`] (the refused-model amendment, item 2).
+pub(crate) fn suggestion_fits(name: &str, tier: Tier, age: Age) -> bool {
+    match StableName::parse(bare_name(name)) {
+        Some(parsed) => parsed.tier == tier && (age != Age::Oldest || parsed.at_or_above_floor()),
+        None => false,
     }
 }
 
@@ -510,6 +530,7 @@ fn digits(text: &str) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::testutil::{TestServer, captured};
 
     const LIST: &[&str] = &[
         "models/gemini-2.0-flash",
@@ -907,56 +928,6 @@ mod tests {
         assert_eq!(ModelChoice::parse(""), ModelChoice::Named(String::new()));
     }
 
-    /// A local HTTP server that answers each request with the next of
-    /// `responses` (status, body) and records each request's head.
-    struct TestServer {
-        base: String,
-        requests: std::sync::Arc<std::sync::Mutex<Vec<String>>>,
-        thread: Option<std::thread::JoinHandle<()>>,
-    }
-
-    impl TestServer {
-        fn start(responses: Vec<(u16, String)>) -> TestServer {
-            use std::io::{Read, Write};
-            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
-            let base = format!("http://{}/v1beta", listener.local_addr().unwrap());
-            let requests = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-            let seen = requests.clone();
-            let thread = std::thread::spawn(move || {
-                for (status, body) in responses {
-                    let (mut stream, _) = listener.accept().unwrap();
-                    let mut head = Vec::new();
-                    let mut byte = [0u8; 1];
-                    while !head.ends_with(b"\r\n\r\n") {
-                        if stream.read(&mut byte).unwrap() == 0 {
-                            break;
-                        }
-                        head.push(byte[0]);
-                    }
-                    seen.lock()
-                        .unwrap()
-                        .push(String::from_utf8_lossy(&head).into_owned());
-                    let reply = format!(
-                        "HTTP/1.1 {status} X\r\nContent-Type: application/json\r\n\
-                         Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                        body.len()
-                    );
-                    stream.write_all(reply.as_bytes()).unwrap();
-                }
-            });
-            TestServer {
-                base,
-                requests,
-                thread: Some(thread),
-            }
-        }
-
-        fn requests(mut self) -> Vec<String> {
-            self.thread.take().unwrap().join().unwrap();
-            self.requests.lock().unwrap().clone()
-        }
-    }
-
     const KEY: &str = "test-key-SECRET-123";
 
     #[tokio::test]
@@ -1023,52 +994,6 @@ mod tests {
         let error = fetch_from(&base, KEY).await.unwrap_err();
         assert!(error.starts_with("gemini: listing models"), "{error}");
         assert!(!error.contains(KEY), "{error}");
-    }
-
-    /// A logger keeping every record with the thread that logged it, so
-    /// tests running at once each see only their own lines.
-    struct CapturedLogger {
-        records: std::sync::Mutex<Vec<(std::thread::ThreadId, log::Level, String)>>,
-    }
-
-    impl log::Log for CapturedLogger {
-        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
-            true
-        }
-
-        fn log(&self, record: &log::Record<'_>) {
-            self.records.lock().unwrap().push((
-                std::thread::current().id(),
-                record.level(),
-                record.args().to_string(),
-            ));
-        }
-
-        fn flush(&self) {}
-    }
-
-    static LOGGER: CapturedLogger = CapturedLogger {
-        records: std::sync::Mutex::new(Vec::new()),
-    };
-
-    /// The records this thread logs while `f` runs.
-    fn captured(f: impl FnOnce()) -> Vec<(log::Level, String)> {
-        static INSTALL: std::sync::Once = std::sync::Once::new();
-        INSTALL.call_once(|| {
-            log::set_logger(&LOGGER).unwrap();
-            log::set_max_level(log::LevelFilter::Trace);
-        });
-        let me = std::thread::current().id();
-        LOGGER.records.lock().unwrap().retain(|(id, ..)| *id != me);
-        f();
-        LOGGER
-            .records
-            .lock()
-            .unwrap()
-            .iter()
-            .filter(|(id, ..)| *id == me)
-            .map(|(_, level, text)| (*level, text.clone()))
-            .collect()
     }
 
     #[test]

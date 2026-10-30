@@ -1,7 +1,7 @@
 ---
 title: Gemini model choice by tier and age, resolved against the account's models
 date: 2026-10-30
-status: Implemented
+status: In implementation
 covers:
   - "A `ModelChoice` in libinfer-gemini: a model asked for by its tier
     (Flash-Lite, Flash, Pro) and its age (newest or oldest still served),
@@ -408,3 +408,10 @@ The owner approved the amendment before this one, as committed at
 `ea79d38` (2026-10-30: "Yes, approve the refused-model plan addition and
 build it"). It is built now; the first implementing commit reopens the
 plan (`In implementation`), as the floor's did.
+
+## Amendment — 2026-10-30 15:45 EDT: back in implementation for the refused model; the document is immutable again
+
+The status returns from `Implemented` to `In implementation` for the
+2026-10-30 15:37 EDT amendment (a refused model is replaced by the
+policy's next choice), approved at 15:39 EDT. The document stays
+immutable; it returns to `Implemented` when that amendment is built.

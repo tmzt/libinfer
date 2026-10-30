@@ -6,10 +6,16 @@
 //! `gemini-rust` types, which this crate re-exports.
 
 mod choice;
+#[cfg(test)]
+mod testutil;
+
+use std::sync::{Mutex, MutexGuard};
 
 use async_compat::CompatExt;
 use async_trait::async_trait;
 use libinfer::{Message, ReasoningEngine, ToolExecutor};
+
+use gemini_rust::{ClientError, ContentBuilder};
 
 pub use gemini_rust::{
     Content, FunctionCall, FunctionCallingMode, FunctionDeclaration, Gemini,
@@ -22,6 +28,10 @@ pub use choice::{
 
 /// The default number of tool-calling steps allowed in one turn.
 pub const DEFAULT_MAX_TURNS: usize = 5;
+
+/// The most times an engine built from a choice replaces a refused model in
+/// its life (the refused-model amendment, item 3).
+const MAX_MODEL_SWITCHES: usize = 3;
 
 /// The model used when none is configured (decision 3; CHANGES.md
 /// 2026-10-23: Google no longer serves `gemini-2.5-flash` to new keys).
@@ -54,6 +64,10 @@ pub fn model_from_name(name: &str) -> Model {
 pub struct GeminiReasoningEngineBuilder {
     api_key: Option<String>,
     model: Option<String>,
+    policy: Option<Policy>,
+    /// The API's base URL (`…/v1beta/`); `None` is Google's. Set only by
+    /// tests, so no test calls the real API.
+    base_url: Option<reqwest::Url>,
     system_prompt: Option<String>,
     tools: Vec<Tool>,
     max_turns: Option<usize>,
@@ -67,9 +81,33 @@ impl GeminiReasoningEngineBuilder {
     }
 
     /// The model, by name (see [`model_from_name`]); unset or empty means
-    /// [`DEFAULT_MODEL`].
+    /// [`DEFAULT_MODEL`]. The engine never switches away from it. Replaces
+    /// an earlier [`choice`](Self::choice).
     pub fn model(mut self, model: impl Into<String>) -> Self {
         self.model = Some(model.into());
+        self.policy = None;
+        self
+    }
+
+    /// The model, by a choice resolved against `catalog` as
+    /// [`ModelCatalog::resolve`] does (and logs). The engine keeps the
+    /// choice and a copy of the catalog: when the API refuses its model
+    /// (HTTP 404, `NOT_FOUND`, naming the model), a rule picks again
+    /// without the refused models, the next lowest at or above
+    /// [`OLDEST_FLOOR`] for *oldest* or the next highest for *newest*;
+    /// Google's suggested model is taken only when the rule has nothing
+    /// left, and only if it is the same tier, stable and, for *oldest*, at
+    /// or above the floor. The request is then sent again on the new
+    /// model, at most 3 times in the engine's life, with one `warn` line
+    /// per switch. A [`ModelChoice::Named`] choice never switches.
+    /// Replaces an earlier [`model`](Self::model).
+    pub fn choice(mut self, choice: ModelChoice, catalog: &ModelCatalog) -> Self {
+        let resolved = catalog.resolve(&choice);
+        self.model = Some(resolved.model);
+        self.policy = Some(Policy {
+            choice,
+            catalog: catalog.clone(),
+        });
         self
     }
 
@@ -99,9 +137,38 @@ impl GeminiReasoningEngineBuilder {
             None => api_key_from_env()?,
         };
         let model = model_from_name(self.model.as_deref().unwrap_or(DEFAULT_MODEL));
-        let engine = GeminiReasoningEngine::with_model(key, model, self.system_prompt, self.tools)?;
+        let mut engine = GeminiReasoningEngine::create(
+            key,
+            model,
+            self.base_url,
+            self.system_prompt,
+            self.tools,
+        )?;
+        engine.policy = self.policy;
         Ok(engine.with_max_turns(self.max_turns.unwrap_or(DEFAULT_MAX_TURNS)))
     }
+
+    /// Sends requests to `base_url` (`…/v1beta/`) instead of Google's.
+    #[cfg(test)]
+    fn base_url(mut self, base_url: &str) -> Self {
+        self.base_url = Some(reqwest::Url::parse(base_url).unwrap());
+        self
+    }
+}
+
+/// What an engine built from a choice keeps to replace a refused model.
+struct Policy {
+    choice: ModelChoice,
+    catalog: ModelCatalog,
+}
+
+/// The model requests go to now, and what the engine has refused.
+struct Current {
+    client: Gemini,
+    model: Model,
+    /// The models the API refused, without `models/`.
+    refused: Vec<String>,
+    switches: usize,
 }
 
 /// A reasoning engine powered by Google Gemini, implementing `ReasoningEngine`.
@@ -109,8 +176,13 @@ impl GeminiReasoningEngineBuilder {
 /// It holds the system prompt and tools itself and builds each request from
 /// them.
 pub struct GeminiReasoningEngine {
-    client: Gemini,
+    /// Kept to build a client for a replacement model; never logged.
+    api_key: String,
+    base_url: Option<reqwest::Url>,
+    /// The model the engine was built with.
     model: Model,
+    current: Mutex<Current>,
+    policy: Option<Policy>,
     system_prompt: Option<String>,
     tools: Vec<Tool>,
     max_turns: usize,
@@ -148,11 +220,28 @@ impl GeminiReasoningEngine {
         system_prompt: Option<String>,
         tools: Vec<Tool>,
     ) -> Result<Self, String> {
-        let client = Gemini::with_model(api_key, model.clone())
-            .map_err(|e| format!("gemini client init: {e}"))?;
+        Self::create(api_key, model, None, system_prompt, tools)
+    }
+
+    fn create(
+        api_key: String,
+        model: Model,
+        base_url: Option<reqwest::Url>,
+        system_prompt: Option<String>,
+        tools: Vec<Tool>,
+    ) -> Result<Self, String> {
+        let client = client_for(&api_key, &model, base_url.as_ref())?;
         Ok(Self {
-            client,
+            api_key,
+            base_url,
+            current: Mutex::new(Current {
+                client,
+                model: model.clone(),
+                refused: Vec::new(),
+                switches: 0,
+            }),
             model,
+            policy: None,
             system_prompt,
             tools,
             max_turns: DEFAULT_MAX_TURNS,
@@ -176,9 +265,89 @@ impl GeminiReasoningEngine {
         self
     }
 
-    /// The model every request goes to.
+    /// The model the engine was built with. Requests go to it unless the
+    /// engine was built from a choice and the API refused it; see
+    /// [`current_model`](Self::current_model).
     pub fn model(&self) -> &Model {
         &self.model
+    }
+
+    /// The model requests go to now: the one the engine was built with, or
+    /// the one that replaced it after a refusal.
+    pub fn current_model(&self) -> Model {
+        self.current().model.clone()
+    }
+
+    fn current(&self) -> MutexGuard<'_, Current> {
+        self.current
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// A request on `client` with the system prompt and tools.
+    fn request(&self, client: &Gemini) -> ContentBuilder {
+        let mut builder = client.generate_content();
+        if let Some(prompt) = self.system_prompt() {
+            builder = builder.with_system_prompt(prompt);
+        }
+        for tool in self.tools() {
+            builder = builder.with_tool(tool.clone());
+        }
+        if !self.tools().is_empty() {
+            builder = builder.with_function_calling_mode(FunctionCallingMode::Auto);
+        }
+        builder
+    }
+
+    /// After `error` from a request sent to `sent`: the client and model to
+    /// send it again on, or `None` to return the error (the refused-model
+    /// amendment, items 2 to 4).
+    fn replace_refused(&self, sent: &Model, error: &ClientError) -> Option<(Gemini, Model)> {
+        let policy = self.policy.as_ref()?;
+        let ModelChoice::Rule { tier, age } = policy.choice else {
+            return None;
+        };
+        let sent_name = choice::bare_name(sent.as_str()).to_string();
+        let suggested = refusal(error, &sent_name)?;
+        let mut current = self.current();
+        if current.model != *sent {
+            // Another request has already replaced it.
+            return Some((current.client.clone(), current.model.clone()));
+        }
+        if !current.refused.contains(&sent_name) {
+            current.refused.push(sent_name.clone());
+        }
+        if current.switches >= MAX_MODEL_SWITCHES {
+            return None;
+        }
+        let (next, how) = match policy.catalog.pick_rule(tier, age, &current.refused) {
+            Some((name, _)) => (name, "policy"),
+            None => match suggested {
+                Some(name)
+                    if choice::suggestion_fits(&name, tier, age)
+                        && !current.refused.contains(&name) =>
+                {
+                    (name, "suggested")
+                }
+                _ => return None,
+            },
+        };
+        let model = model_from_name(&next);
+        let client = match client_for(&self.api_key, &model, self.base_url.as_ref()) {
+            Ok(client) => client,
+            Err(e) => {
+                log::error!("libinfer-gemini: {e}");
+                return None;
+            }
+        };
+        current.client = client.clone();
+        current.model = model.clone();
+        current.switches += 1;
+        log::warn!(
+            "gemini: {sent_name} was refused; {} now uses {next} ({how})",
+            policy.choice
+        );
+        Some((client, model))
     }
 
     /// The system prompt sent with every request, if any.
@@ -222,25 +391,17 @@ impl ReasoningEngine for GeminiReasoningEngine {
             return Ok(None);
         }
 
-        let mut builder = self.client.generate_content();
-
-        if let Some(prompt) = self.system_prompt() {
-            builder = builder.with_system_prompt(prompt);
-        }
-
-        for tool in self.tools() {
-            builder = builder.with_tool(tool.clone());
-        }
-
-        if !self.tools().is_empty() {
-            builder = builder.with_function_calling_mode(FunctionCallingMode::Auto);
-        }
+        let (client, mut model) = {
+            let current = self.current();
+            (current.client.clone(), current.model.clone())
+        };
+        let mut builder = self.request(&client);
 
         // Add all historical messages to the builder
         log::info!(
             "libinfer-gemini: Compiling {} messages into a {} request (tools: {})",
             turns.len(),
-            self.model,
+            model,
             self.tools().len()
         );
         for (i, turn) in turns.iter().enumerate() {
@@ -266,10 +427,23 @@ impl ReasoningEngine for GeminiReasoningEngine {
                 turn_idx + 1,
                 self.max_turns
             );
-            let response = builder.clone().execute().compat().await.map_err(|e| {
-                log::error!("libinfer-gemini: Gemini API request failed: {}", e);
-                format!("gemini generate: {e}")
-            })?;
+            let response = loop {
+                match builder.clone().execute().compat().await {
+                    Ok(response) => break response,
+                    Err(e) => {
+                        if let Some((client, next)) = self.replace_refused(&model, &e) {
+                            // The same request, sent again on the new model.
+                            let contents = std::mem::take(&mut builder.contents);
+                            builder = self.request(&client);
+                            builder.contents = contents;
+                            model = next;
+                            continue;
+                        }
+                        log::error!("libinfer-gemini: Gemini API request failed: {}", e);
+                        return Err(format!("gemini generate: {e}"));
+                    }
+                }
+            };
 
             let calls = response.function_calls_with_thoughts();
             if let Some((fc, thought_signature)) = calls.first() {
@@ -316,6 +490,67 @@ impl ReasoningEngine for GeminiReasoningEngine {
             self.max_turns
         ))
     }
+}
+
+/// A client for `model` with `api_key`, on `base_url` when given.
+fn client_for(
+    api_key: &str,
+    model: &Model,
+    base_url: Option<&reqwest::Url>,
+) -> Result<Gemini, String> {
+    match base_url {
+        None => Gemini::with_model(api_key, model.clone()),
+        Some(base) => Gemini::with_model_and_base_url(api_key, model.clone(), base.clone()),
+    }
+    .map_err(|e| format!("gemini client init: {e}"))
+}
+
+/// When `error` is the API refusing `model` (HTTP 404 with status
+/// `NOT_FOUND` and a message naming `models/<model>` before any
+/// suggestion): `Some` of the model Google suggests instead (the
+/// `models/<name>` after "use"), if any.
+/// `None` for any other error.
+fn refusal(error: &ClientError, model: &str) -> Option<Option<String>> {
+    let ClientError::BadResponse {
+        code: 404,
+        description: Some(body),
+    } = error
+    else {
+        return None;
+    };
+    let body: serde_json::Value = serde_json::from_str(body).ok()?;
+    let error = body.get("error")?;
+    if error.get("status")?.as_str()? != "NOT_FOUND" {
+        return None;
+    }
+    let message = error.get("message")?.as_str()?;
+    // The refused model is named before "use models/<suggested>".
+    let (refused, suggested) = match message.split_once("use models/") {
+        Some((before, after)) => (before, Some(model_name_at(after))),
+        None => (message, None),
+    };
+    if !model_names(refused).any(|named| named == model) {
+        return None;
+    }
+    Some(
+        suggested
+            .filter(|name| !name.is_empty())
+            .map(str::to_string),
+    )
+}
+
+/// Every name written as `models/<name>` in `text`.
+fn model_names(text: &str) -> impl Iterator<Item = &str> {
+    text.split("models/").skip(1).map(model_name_at)
+}
+
+/// The model name at the start of `text`: letters, digits, `-`, `.` and
+/// `_`, without a trailing `.` or `-` (the end of a sentence).
+fn model_name_at(text: &str) -> &str {
+    let end = text
+        .find(|c: char| !(c.is_ascii_alphanumeric() || matches!(c, '-' | '.' | '_')))
+        .unwrap_or(text.len());
+    text[..end].trim_end_matches(['.', '-'])
 }
 
 #[cfg(test)]
@@ -396,5 +631,398 @@ mod tests {
             built_with("models/gemini-9-ultra"),
             Model::Custom("models/gemini-9-ultra".to_string())
         );
+    }
+
+    // The refused-model amendment (plan 20261030_01, 15:37 EDT), item 7.
+
+    use crate::testutil::{TestServer, captured};
+
+    const KEY: &str = "test-key-SECRET-123";
+
+    /// The API's refusal, as flankr's daemon logged it.
+    fn refused(model: &str, suggested: &str) -> (u16, String) {
+        (
+            404,
+            format!(
+                r#"{{"error": {{"code": 404, "message": "This model models/{model} is no longer available to new users. Please update your code to use models/{suggested} instead.", "status": "NOT_FOUND"}}}}"#
+            ),
+        )
+    }
+
+    fn answer(text: &str) -> (u16, String) {
+        (
+            200,
+            format!(
+                r#"{{"candidates": [{{"content": {{"role": "model", "parts": [{{"text": "{text}"}}]}}}}]}}"#
+            ),
+        )
+    }
+
+    fn lite_oldest() -> ModelChoice {
+        ModelChoice::Rule {
+            tier: Tier::FlashLite,
+            age: Age::Oldest,
+        }
+    }
+
+    fn engine_on(
+        server: &TestServer,
+        choice: ModelChoice,
+        names: &[&str],
+    ) -> GeminiReasoningEngine {
+        GeminiReasoningEngine::builder()
+            .api_key(Some(KEY.to_string()))
+            .base_url(&format!("{}/", server.base))
+            .choice(choice, &ModelCatalog::from_names(names))
+            .build()
+            .unwrap()
+    }
+
+    /// The engine's answer to "hello", and this thread's log lines at
+    /// `warn` and above while it ran.
+    fn ask(engine: &GeminiReasoningEngine) -> (Result<Option<String>, String>, Vec<String>) {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let executor = libinfer::MockToolExecutor::new();
+        let mut result = None;
+        let lines = captured(|| {
+            result = Some(runtime.block_on(engine.process_transcript("hello", &executor)));
+        });
+        for (_, text) in &lines {
+            assert!(!text.contains(KEY), "{text}");
+        }
+        let warnings = lines
+            .into_iter()
+            .filter(|(level, _)| *level <= log::Level::Warn)
+            .map(|(_, text)| text)
+            .collect();
+        (result.unwrap(), warnings)
+    }
+
+    /// The model each request went to.
+    fn models_requested(server: TestServer) -> Vec<String> {
+        server
+            .requests()
+            .iter()
+            .map(|request| {
+                let path = request.split(' ').nth(1).unwrap();
+                let model = path.strip_prefix("/v1beta/models/").unwrap();
+                model.strip_suffix(":generateContent").unwrap().to_string()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_refused_oldest_model_steps_to_the_next_listed_not_to_the_suggestion() {
+        // The owner's case: Google suggests 3.8, but 3.6 is listed.
+        let server = TestServer::start(vec![
+            refused("gemini-3.5-flash-lite", "gemini-3.8-flash-lite"),
+            answer("hi"),
+        ]);
+        let engine = engine_on(
+            &server,
+            lite_oldest(),
+            &[
+                "gemini-2.5-flash-lite",
+                "gemini-3.5-flash-lite",
+                "gemini-3.6-flash-lite",
+                "gemini-3.8-flash-lite",
+                "gemini-flash-lite-latest",
+            ],
+        );
+        assert_eq!(
+            engine.current_model().as_str(),
+            "models/gemini-3.5-flash-lite"
+        );
+        let (result, warnings) = ask(&engine);
+        assert_eq!(result, Ok(Some("hi".to_string())));
+        assert_eq!(
+            warnings,
+            vec![
+                "gemini: gemini-3.5-flash-lite was refused; flash-lite:oldest now uses \
+                 gemini-3.6-flash-lite (policy)"
+            ]
+        );
+        assert_eq!(
+            models_requested(server),
+            vec!["gemini-3.5-flash-lite", "gemini-3.6-flash-lite"]
+        );
+        assert_eq!(
+            engine.current_model().as_str(),
+            "models/gemini-3.6-flash-lite"
+        );
+        assert_eq!(engine.model().as_str(), "models/gemini-3.5-flash-lite");
+    }
+
+    #[test]
+    fn the_next_request_stays_on_the_replacement() {
+        let server = TestServer::start(vec![
+            refused("gemini-3.5-flash-lite", "gemini-3.8-flash-lite"),
+            answer("one"),
+            answer("two"),
+        ]);
+        let engine = engine_on(
+            &server,
+            lite_oldest(),
+            &["gemini-3.5-flash-lite", "gemini-3.6-flash-lite"],
+        );
+        assert_eq!(ask(&engine).0, Ok(Some("one".to_string())));
+        let (result, warnings) = ask(&engine);
+        assert_eq!(result, Ok(Some("two".to_string())));
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(
+            models_requested(server),
+            vec![
+                "gemini-3.5-flash-lite",
+                "gemini-3.6-flash-lite",
+                "gemini-3.6-flash-lite"
+            ]
+        );
+    }
+
+    #[test]
+    fn a_refused_newest_alias_steps_to_the_highest_version() {
+        let server = TestServer::start(vec![
+            refused("gemini-flash-latest", "gemini-3.5-flash"),
+            answer("hi"),
+        ]);
+        let engine = engine_on(
+            &server,
+            ModelChoice::Rule {
+                tier: Tier::Flash,
+                age: Age::Newest,
+            },
+            &[
+                "gemini-flash-latest",
+                "gemini-3.5-flash",
+                "gemini-3.8-flash",
+            ],
+        );
+        let (result, warnings) = ask(&engine);
+        assert_eq!(result, Ok(Some("hi".to_string())));
+        assert_eq!(
+            warnings,
+            vec![
+                "gemini: gemini-flash-latest was refused; flash:newest now uses \
+                 gemini-3.8-flash (policy)"
+            ]
+        );
+        assert_eq!(
+            models_requested(server),
+            vec!["gemini-flash-latest", "gemini-3.8-flash"]
+        );
+    }
+
+    #[test]
+    fn the_suggestion_is_used_when_the_rule_has_nothing_left() {
+        let server = TestServer::start(vec![
+            refused("gemini-3.5-flash-lite", "gemini-3.8-flash-lite"),
+            answer("hi"),
+        ]);
+        let engine = engine_on(
+            &server,
+            lite_oldest(),
+            &["gemini-2.5-flash-lite", "gemini-3.5-flash-lite"],
+        );
+        let (result, warnings) = ask(&engine);
+        assert_eq!(result, Ok(Some("hi".to_string())));
+        assert_eq!(
+            warnings,
+            vec![
+                "gemini: gemini-3.5-flash-lite was refused; flash-lite:oldest now uses \
+                 gemini-3.8-flash-lite (suggested)"
+            ]
+        );
+        assert_eq!(
+            models_requested(server),
+            vec!["gemini-3.5-flash-lite", "gemini-3.8-flash-lite"]
+        );
+    }
+
+    /// One refusal suggesting `suggested`, with nothing left in the list:
+    /// the 404 is returned and nothing switches.
+    fn suggestion_is_not_taken(choice: ModelChoice, model: &str, suggested: &str) {
+        let server = TestServer::start(vec![refused(model, suggested)]);
+        let engine = engine_on(&server, choice, &[model]);
+        let (result, warnings) = ask(&engine);
+        let error = result.unwrap_err();
+        assert!(error.contains("code 404"), "{error}");
+        assert!(error.contains("NOT_FOUND"), "{error}");
+        assert_eq!(warnings.len(), 1, "{warnings:?}");
+        assert!(warnings[0].contains("request failed"), "{warnings:?}");
+        assert_eq!(models_requested(server), vec![model]);
+        assert_eq!(engine.current_model(), model_from_name(model));
+    }
+
+    #[test]
+    fn the_suggestion_is_refused_below_the_floor_or_in_another_tier() {
+        suggestion_is_not_taken(
+            lite_oldest(),
+            "gemini-3.5-flash-lite",
+            "gemini-2.5-flash-lite",
+        );
+        suggestion_is_not_taken(lite_oldest(), "gemini-3.5-flash-lite", "gemini-3.8-flash");
+        suggestion_is_not_taken(
+            lite_oldest(),
+            "gemini-3.5-flash-lite",
+            "gemini-3.8-flash-lite-preview",
+        );
+        // The same model suggested back is not taken either.
+        suggestion_is_not_taken(
+            lite_oldest(),
+            "gemini-3.5-flash-lite",
+            "gemini-3.5-flash-lite",
+        );
+    }
+
+    #[test]
+    fn newest_takes_a_suggestion_below_the_floor() {
+        let server = TestServer::start(vec![
+            refused("gemini-3.8-flash", "gemini-2.5-flash"),
+            answer("hi"),
+        ]);
+        let engine = engine_on(
+            &server,
+            ModelChoice::Rule {
+                tier: Tier::Flash,
+                age: Age::Newest,
+            },
+            &["gemini-3.8-flash"],
+        );
+        assert_eq!(ask(&engine).0, Ok(Some("hi".to_string())));
+        assert_eq!(
+            models_requested(server),
+            vec!["gemini-3.8-flash", "gemini-2.5-flash"]
+        );
+    }
+
+    #[test]
+    fn a_named_model_is_not_switched() {
+        suggestion_is_not_taken(
+            ModelChoice::Named("gemini-3.5-flash-lite".into()),
+            "gemini-3.5-flash-lite",
+            "gemini-3.8-flash-lite",
+        );
+        let server = TestServer::start(vec![refused(
+            "gemini-3.5-flash-lite",
+            "gemini-3.6-flash-lite",
+        )]);
+        let engine = engine_on(
+            &server,
+            ModelChoice::Named("gemini-3.5-flash-lite".into()),
+            &["gemini-3.5-flash-lite", "gemini-3.6-flash-lite"],
+        );
+        assert!(ask(&engine).0.is_err());
+        assert_eq!(models_requested(server), vec!["gemini-3.5-flash-lite"]);
+    }
+
+    #[test]
+    fn an_engine_built_by_name_is_not_switched() {
+        let server = TestServer::start(vec![refused(
+            "gemini-3.5-flash-lite",
+            "gemini-3.6-flash-lite",
+        )]);
+        let engine = GeminiReasoningEngine::builder()
+            .api_key(Some(KEY.to_string()))
+            .base_url(&format!("{}/", server.base))
+            .choice(
+                lite_oldest(),
+                &ModelCatalog::from_names(["gemini-3.0-flash-lite"]),
+            )
+            .model("gemini-3.5-flash-lite")
+            .build()
+            .unwrap();
+        assert!(ask(&engine).0.is_err());
+        assert_eq!(models_requested(server), vec!["gemini-3.5-flash-lite"]);
+    }
+
+    #[test]
+    fn at_most_three_switches() {
+        let names = [
+            "gemini-3.0-flash-lite",
+            "gemini-3.1-flash-lite",
+            "gemini-3.2-flash-lite",
+            "gemini-3.3-flash-lite",
+            "gemini-3.4-flash-lite",
+        ];
+        let server = TestServer::start(
+            names[..4]
+                .iter()
+                .map(|name| refused(name, "gemini-3.8-flash-lite"))
+                .collect(),
+        );
+        let engine = engine_on(&server, lite_oldest(), &names);
+        let (result, warnings) = ask(&engine);
+        assert!(result.unwrap_err().contains("code 404"));
+        let switches: Vec<_> = warnings
+            .iter()
+            .filter(|w| w.contains("was refused"))
+            .collect();
+        assert_eq!(switches.len(), 3, "{warnings:?}");
+        assert_eq!(models_requested(server), names[..4].to_vec());
+        assert_eq!(
+            engine.current_model(),
+            model_from_name("gemini-3.3-flash-lite")
+        );
+    }
+
+    #[test]
+    fn other_errors_do_not_switch() {
+        let not_this_model = refused("gemini-3.0-flash-lite", "gemini-3.8-flash-lite");
+        let other_status = (
+            404,
+            r#"{"error": {"code": 404, "message": "models/gemini-3.5-flash-lite: no", "status": "UNAVAILABLE"}}"#
+                .to_string(),
+        );
+        let server_error = (
+            500,
+            r#"{"error": {"code": 500, "message": "models/gemini-3.5-flash-lite failed", "status": "NOT_FOUND"}}"#
+                .to_string(),
+        );
+        for response in [not_this_model, other_status, server_error] {
+            let server = TestServer::start(vec![response]);
+            let engine = engine_on(
+                &server,
+                lite_oldest(),
+                &["gemini-3.5-flash-lite", "gemini-3.6-flash-lite"],
+            );
+            assert!(ask(&engine).0.is_err());
+            assert_eq!(models_requested(server), vec!["gemini-3.5-flash-lite"]);
+        }
+    }
+
+    #[test]
+    fn a_refusal_is_read_from_the_apis_error() {
+        let bad = |code, body: &str| ClientError::BadResponse {
+            code,
+            description: Some(body.to_string()),
+        };
+        // The text flankr's daemon logged.
+        let logged = bad(
+            404,
+            r#"{"error": {"code": 404, "message": "This model models/gemini-2.5-flash-lite is no longer available to new users. Please update your code to use models/gemini-3.5-flash-lite …", "status": "NOT_FOUND"}}"#,
+        );
+        assert_eq!(
+            refusal(&logged, "gemini-2.5-flash-lite"),
+            Some(Some("gemini-3.5-flash-lite".to_string()))
+        );
+        assert_eq!(refusal(&logged, "gemini-2.5-flash"), None);
+        assert_eq!(refusal(&logged, "gemini-3.5-flash-lite"), None);
+        let not_found = bad(
+            404,
+            r#"{"error": {"code": 404, "message": "models/gemini-3.8-flash-lite is not found for API version v1beta, or is not supported for generateContent.", "status": "NOT_FOUND"}}"#,
+        );
+        assert_eq!(refusal(&not_found, "gemini-3.8-flash-lite"), Some(None));
+        assert_eq!(
+            refusal(&bad(404, "not json"), "gemini-3.8-flash-lite"),
+            None
+        );
+        let no_body = ClientError::BadResponse {
+            code: 404,
+            description: None,
+        };
+        assert_eq!(refusal(&no_body, "gemini-3.8-flash-lite"), None);
     }
 }
