@@ -401,3 +401,10 @@ adds:
    Google's suggestion used when the rule has nothing left, and refused
    when below the floor or another tier; a named model not switched; at
    most 3 switches; the key in no log line.
+
+## Amendment — 2026-10-30 15:39 EDT: the refused-model addition approved
+
+The owner approved the amendment before this one, as committed at
+`ea79d38` (2026-10-30: "Yes, approve the refused-model plan addition and
+build it"). It is built now; the first implementing commit reopens the
+plan (`In implementation`), as the floor's did.
