@@ -205,10 +205,19 @@ impl ModelCatalog {
     /// The model name `choice` resolves to (without `models/`), and how
     /// (decisions 3 to 5). An empty catalog counts as no list, as
     /// [`resolve_offline`].
+    ///
+    /// Logs one `info` line naming the choice and the model, or one `warn`
+    /// for a fallback or a named model the list lacks (decision 6).
     pub fn resolve(&self, choice: &ModelChoice) -> Resolved {
         if self.names.is_empty() {
             return resolve_offline(choice);
         }
+        let resolved = self.resolve_listed(choice);
+        log_resolution(choice, &resolved, true);
+        resolved
+    }
+
+    fn resolve_listed(&self, choice: &ModelChoice) -> Resolved {
         match choice {
             ModelChoice::Named(name) => {
                 let model = bare_name(name).to_string();
@@ -253,14 +262,39 @@ impl ModelCatalog {
 }
 
 /// Resolves `choice` without a catalog: a `Named` choice as given, a rule
-/// to [`DEFAULT_MODEL`] (decision 5).
+/// to [`DEFAULT_MODEL`] (decision 5). Logs as [`ModelCatalog::resolve`].
 pub fn resolve_offline(choice: &ModelChoice) -> Resolved {
-    match choice {
+    let resolved = match choice {
         ModelChoice::Named(name) => Resolved {
             model: bare_name(name).to_string(),
             how: How::Named,
         },
         ModelChoice::Rule { .. } => fallback(),
+    };
+    log_resolution(choice, &resolved, false);
+    resolved
+}
+
+/// One line per resolution (decision 6); `listed` says whether there was
+/// a model list to resolve against. Never given the key.
+fn log_resolution(choice: &ModelChoice, resolved: &Resolved, listed: bool) {
+    let model = &resolved.model;
+    match resolved.how {
+        How::Alias | How::Matched | How::Named => {
+            log::info!("gemini: {choice} is {model}");
+        }
+        How::NamedMissing => {
+            log::warn!("gemini: {choice} is not in the key's model list; using {model} as given");
+        }
+        How::Fallback => {
+            let why = match (choice, listed) {
+                (ModelChoice::Rule { tier, .. }, true) => {
+                    format!("no served {tier} model in the key's model list")
+                }
+                _ => "no model list".to_string(),
+            };
+            log::warn!("gemini: {choice}: {why}; using {model}");
+        }
     }
 }
 
@@ -868,5 +902,137 @@ mod tests {
         let error = fetch_from(&base, KEY).await.unwrap_err();
         assert!(error.starts_with("gemini: listing models"), "{error}");
         assert!(!error.contains(KEY), "{error}");
+    }
+
+    /// A logger keeping every record with the thread that logged it, so
+    /// tests running at once each see only their own lines.
+    struct CapturedLogger {
+        records: std::sync::Mutex<Vec<(std::thread::ThreadId, log::Level, String)>>,
+    }
+
+    impl log::Log for CapturedLogger {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+
+        fn log(&self, record: &log::Record<'_>) {
+            self.records.lock().unwrap().push((
+                std::thread::current().id(),
+                record.level(),
+                record.args().to_string(),
+            ));
+        }
+
+        fn flush(&self) {}
+    }
+
+    static LOGGER: CapturedLogger = CapturedLogger {
+        records: std::sync::Mutex::new(Vec::new()),
+    };
+
+    /// The records this thread logs while `f` runs.
+    fn captured(f: impl FnOnce()) -> Vec<(log::Level, String)> {
+        static INSTALL: std::sync::Once = std::sync::Once::new();
+        INSTALL.call_once(|| {
+            log::set_logger(&LOGGER).unwrap();
+            log::set_max_level(log::LevelFilter::Trace);
+        });
+        let me = std::thread::current().id();
+        LOGGER.records.lock().unwrap().retain(|(id, ..)| *id != me);
+        f();
+        LOGGER
+            .records
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(id, ..)| *id == me)
+            .map(|(_, level, text)| (*level, text.clone()))
+            .collect()
+    }
+
+    #[test]
+    fn a_match_logs_one_info_line() {
+        let catalog = catalog();
+        let lines = captured(|| {
+            catalog.resolve(&rule(Tier::FlashLite, Age::Oldest));
+        });
+        assert_eq!(
+            lines,
+            vec![(
+                log::Level::Info,
+                "gemini: flash-lite:oldest is gemini-2.0-flash-lite".to_string()
+            )]
+        );
+        let lines = captured(|| {
+            catalog.resolve(&ModelChoice::Named("gemini-2.5-pro".into()));
+        });
+        assert_eq!(
+            lines,
+            vec![(
+                log::Level::Info,
+                "gemini: gemini-2.5-pro is gemini-2.5-pro".to_string()
+            )]
+        );
+    }
+
+    #[test]
+    fn a_fallback_logs_one_warning() {
+        let no_pro = ModelCatalog::from_names(["gemini-2.5-flash"]);
+        let lines = captured(|| {
+            no_pro.resolve(&rule(Tier::Pro, Age::Newest));
+        });
+        assert_eq!(
+            lines,
+            vec![(
+                log::Level::Warn,
+                format!(
+                    "gemini: pro:newest: no served pro model in the key's model list; \
+                     using {DEFAULT_MODEL}"
+                )
+            )]
+        );
+        let lines = captured(|| {
+            resolve_offline(&rule(Tier::Flash, Age::Newest));
+        });
+        assert_eq!(
+            lines,
+            vec![(
+                log::Level::Warn,
+                format!("gemini: flash:newest: no model list; using {DEFAULT_MODEL}")
+            )]
+        );
+    }
+
+    #[test]
+    fn a_missing_named_model_logs_one_warning() {
+        let catalog = catalog();
+        let lines = captured(|| {
+            catalog.resolve(&ModelChoice::Named("gemini-3.8-flash-lite".into()));
+        });
+        assert_eq!(
+            lines,
+            vec![(
+                log::Level::Warn,
+                "gemini: gemini-3.8-flash-lite is not in the key's model list; \
+                 using gemini-3.8-flash-lite as given"
+                    .to_string()
+            )]
+        );
+    }
+
+    #[tokio::test]
+    async fn fetching_and_resolving_never_log_the_key() {
+        let page = r#"{"models": [{"name": "models/gemini-2.5-flash",
+            "supportedGenerationMethods": ["generateContent"]}]}"#;
+        let server = TestServer::start(vec![(200, page.into())]);
+        let catalog = fetch_from(&server.base, KEY).await.unwrap();
+        server.requests();
+        let lines = captured(|| {
+            catalog.resolve(&rule(Tier::Flash, Age::Newest));
+            catalog.resolve(&rule(Tier::Pro, Age::Oldest));
+            catalog.resolve(&ModelChoice::Named("gemini-x".into()));
+        });
+        assert_eq!(lines.len(), 3, "{lines:?}");
+        assert!(lines.iter().all(|(_, text)| !text.contains(KEY)));
     }
 }
