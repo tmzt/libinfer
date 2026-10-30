@@ -1,7 +1,7 @@
 ---
 title: Gemini model choice by tier and age, resolved against the account's models
 date: 2026-10-30
-status: In implementation
+status: Implemented
 covers:
   - "A `ModelChoice` in libinfer-gemini: a model asked for by its tier
     (Flash-Lite, Flash, Pro) and its age (newest or oldest still served),
@@ -343,3 +343,16 @@ The status returns from `Implemented` to `In implementation` for the
 2026-10-30 15:23 EDT amendment (a floor for *oldest*: the first 3.x
 model). The document stays immutable; it returns to `Implemented` when
 that amendment is built.
+
+## Amendment — 2026-10-30 15:26 EDT: implemented again
+
+The 2026-10-30 15:23 EDT amendment (a floor for *oldest*) is built; the
+status returns to `Implemented`. The commits, on the `oldest-floor`
+branch:
+
+1. **The floor** (items 1 to 3): `3641ed2` (`OLDEST_FLOOR` and
+   `Age::Oldest` in `libinfer-gemini/src/choice.rs`, re-exported from
+   the crate root; this commit also set `In implementation`).
+2. **The release** (item 5): `2034383` (libinfer-gemini 0.2.0 and its
+   `VERSIONS.md` entry, marked **Breaking (behaviour)**). The tag
+   `v0.2.0` goes on `2034383` when the branch lands; the owner tags it.
